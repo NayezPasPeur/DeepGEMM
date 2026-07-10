@@ -402,6 +402,224 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
 }
 
 
+static torch::Tensor fp8_fp4_prefill_paged_mqa_logits(
+                                        const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
+                                        const torch::Tensor& fused_kv_cache,
+                                        const torch::Tensor& weights,
+                                        const torch::Tensor& cu_seq_len_k_start,
+                                        const torch::Tensor& cu_seq_len_k_end,
+                                        const torch::Tensor& block_table,
+                                        const torch::Tensor& seq_indices,
+                                        const bool& clean_logits,
+                                        const int& max_seqlen_k,
+                                        const at::ScalarType& logits_dtype,
+                                        const bool& force_contiguous,
+                                        const bool& separated_storage) {
+    const auto [q_fp, q_sf] = q;
+    const bool is_fp4 = q_sf.has_value();
+    int seq_len, num_heads, head_dim;
+
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+
+    torch::Tensor kv_cache, kv_cache_sf;
+    int num_kv_blocks, block_kv;
+    int kv_cache_stride_bytes;
+
+    if (is_fp4) {
+        std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
+        head_dim *= 2;
+        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
+        DG_HOST_ASSERT(q_fp.is_contiguous());
+        DG_HOST_ASSERT(q_fp.scalar_type() == kPackedFP4);
+
+        auto [_seq_len, _num_heads] = get_shape<2>(q_sf.value());
+        DG_HOST_ASSERT(seq_len == _seq_len and num_heads == _num_heads);
+        DG_HOST_ASSERT(q_sf.value().is_contiguous());
+        DG_HOST_ASSERT(q_sf.value().scalar_type() == torch::kInt32);
+
+        int num_heads_kv, fp4_with_sf_bytes;
+        std::tie(num_kv_blocks, block_kv, num_heads_kv, fp4_with_sf_bytes) = get_shape<4>(fused_kv_cache);
+        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
+        DG_HOST_ASSERT(num_heads_kv == 1 and fp4_with_sf_bytes == head_dim / 2 + static_cast<int>(sizeof(int)));
+        DG_HOST_ASSERT(fused_kv_cache.stride(1) == fp4_with_sf_bytes and fused_kv_cache.stride(3) == 1);
+        DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kByte);
+
+        kv_cache_stride_bytes = fused_kv_cache.stride(0);
+        DG_HOST_ASSERT(kv_cache_stride_bytes % sizeof(int) == 0);
+        kv_cache = torch::from_blob(
+            fused_kv_cache.data_ptr(),
+            {num_kv_blocks, block_kv, head_dim / 2},
+            {kv_cache_stride_bytes, head_dim / 2, 1},
+            torch::TensorOptions().dtype(kPackedFP4)
+        );
+        kv_cache_sf = torch::from_blob(
+            fused_kv_cache.data_ptr<uint8_t>() + block_kv * head_dim / 2,
+            {num_kv_blocks, block_kv},
+            {kv_cache_stride_bytes / static_cast<int>(sizeof(int)), 1},
+            torch::TensorOptions().dtype(torch::kInt32)
+        );
+    } else {
+        std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
+        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+        DG_HOST_ASSERT(q_fp.is_contiguous());
+        DG_HOST_ASSERT(q_fp.scalar_type() == torch::kFloat8_e4m3fn);
+
+        int num_heads_kv, head_dim_with_sf;
+        std::tie(num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf) = get_shape<4>(fused_kv_cache);
+        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
+        DG_HOST_ASSERT(num_heads_kv == 1 and head_dim_with_sf == head_dim + static_cast<int>(sizeof(float)));
+        DG_HOST_ASSERT(fused_kv_cache.stride(1) == head_dim_with_sf and fused_kv_cache.stride(3) == 1);
+        DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kByte);
+
+        kv_cache_stride_bytes = fused_kv_cache.stride(0);
+        DG_HOST_ASSERT(kv_cache_stride_bytes % sizeof(float) == 0);
+        kv_cache = torch::from_blob(
+            fused_kv_cache.data_ptr(),
+            {num_kv_blocks, block_kv, head_dim},
+            {kv_cache_stride_bytes, head_dim, 1},
+            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
+        );
+        kv_cache_sf = torch::from_blob(
+            fused_kv_cache.data_ptr<uint8_t>() + block_kv * head_dim,
+            {num_kv_blocks, block_kv},
+            {kv_cache_stride_bytes / static_cast<int>(sizeof(float)), 1},
+            torch::TensorOptions().dtype(torch::kFloat32)
+        );
+    }
+
+    // Check weights
+    auto [_seq_len, _num_heads] = get_shape<2>(weights);
+    DG_HOST_ASSERT(seq_len == _seq_len and num_heads == _num_heads);
+    DG_HOST_ASSERT(weights.stride(1) == 1);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat or weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(weights.scalar_type() != torch::kBFloat16 or logits_dtype == torch::kBFloat16);
+
+    // Check cu_seq_len_k_start/end
+    DG_HOST_ASSERT(cu_seq_len_k_start.size(0) == seq_len);
+    DG_HOST_ASSERT(cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_start.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(cu_seq_len_k_end.size(0) == seq_len);
+    DG_HOST_ASSERT(cu_seq_len_k_end.is_contiguous() and cu_seq_len_k_end.scalar_type() == torch::kInt);
+
+    // Check block_table
+    DG_HOST_ASSERT(block_table.dim() == 2);
+    DG_HOST_ASSERT(block_table.stride(1) == 1);
+    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt);
+    int block_table_stride = block_table.stride(0);
+
+    // Check seq_indices
+    DG_HOST_ASSERT(seq_indices.size(0) == seq_len);
+    DG_HOST_ASSERT(seq_indices.is_contiguous() and seq_indices.scalar_type() == torch::kInt);
+
+    // Allocate output
+    constexpr int block_qh = 128;
+    constexpr int split_kv = 256;
+    const int block_q = block_qh / num_heads;
+    DG_HOST_ASSERT(block_qh % num_heads == 0);
+
+    torch::Tensor logits;
+    int aligned_seq_len = align(seq_len, block_q), stride_logits;
+    const int stride_logits_alignment = 1024 / static_cast<int>(c10::elementSize(logits_dtype));
+    const int total_kv_tokens = num_kv_blocks * block_kv;
+    if (max_seqlen_k == 0) {
+        stride_logits = align(total_kv_tokens + split_kv, stride_logits_alignment);
+        logits = torch::empty({aligned_seq_len, stride_logits}, q_fp.options().dtype(logits_dtype));
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, total_kv_tokens)});
+    } else {
+        stride_logits = align(align(max_seqlen_k, split_kv), stride_logits_alignment);
+        logits = torch::empty({aligned_seq_len, stride_logits}, q_fp.options().dtype(logits_dtype));
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, max_seqlen_k)});
+        DG_HOST_ASSERT(not clean_logits);
+    }
+
+    // Dispatch
+    sm100_prefill_paged_mqa_logits(is_fp4, q_fp, q_sf, kv_cache, kv_cache_sf, weights,
+                                   cu_seq_len_k_start, cu_seq_len_k_end, logits,
+                                   block_table, seq_indices, logits_dtype,
+                                   seq_len, num_kv_blocks, num_heads, head_dim,
+                                   block_kv, max_seqlen_k, stride_logits, block_table_stride,
+                                   block_q, split_kv, force_contiguous, separated_storage);
+
+    // Clean unfilled logits
+    if (clean_logits)
+        smxx_clean_logits(logits, cu_seq_len_k_start, cu_seq_len_k_end, 1, seq_len, total_kv_tokens, stride_logits);
+    return logits;
+}
+
+// Separated-storage variant: kv_data [num_blocks, block_kv, head_dim] and kv_sf [num_blocks, block_kv] as separate tensors
+// Supports non-contiguous block_table with 2D TMA per-page (row offset = page_coord * block_kv)
+static torch::Tensor fp8_prefill_paged_mqa_logits_separated(
+                                        const torch::Tensor& q,
+                                        const torch::Tensor& kv_data,
+                                        const torch::Tensor& kv_sf,
+                                        const torch::Tensor& weights,
+                                        const torch::Tensor& cu_seq_len_k_start,
+                                        const torch::Tensor& cu_seq_len_k_end,
+                                        const torch::Tensor& block_table,
+                                        const torch::Tensor& seq_indices,
+                                        const int& max_seqlen_k,
+                                        const at::ScalarType& logits_dtype) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+
+    auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
+    DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
+    DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(q.is_contiguous() and q.scalar_type() == torch::kFloat8_e4m3fn);
+
+    // kv_data: [num_blocks, block_kv, head_dim] FP8, contiguous per-page (no scale gap)
+    auto [num_kv_blocks, block_kv, _head_dim] = get_shape<3>(kv_data);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
+    DG_HOST_ASSERT(_head_dim == head_dim);
+    DG_HOST_ASSERT(kv_data.stride(2) == 1 and kv_data.stride(1) == head_dim);
+    DG_HOST_ASSERT(kv_data.scalar_type() == torch::kFloat8_e4m3fn);
+
+    // kv_sf: [num_blocks, block_kv] float, contiguous
+    auto [_num_kv_blocks, _block_kv] = get_shape<2>(kv_sf);
+    DG_HOST_ASSERT(_num_kv_blocks == num_kv_blocks and _block_kv == block_kv);
+    DG_HOST_ASSERT(kv_sf.stride(1) == 1);
+    DG_HOST_ASSERT(kv_sf.scalar_type() == torch::kFloat32);
+
+    // weights, cu_seq_len_k, block_table, seq_indices checks
+    auto [_seq_len, _num_heads] = get_shape<2>(weights);
+    DG_HOST_ASSERT(seq_len == _seq_len and num_heads == _num_heads);
+    DG_HOST_ASSERT(weights.stride(1) == 1 and weights.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(cu_seq_len_k_start.size(0) == seq_len and cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_start.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(cu_seq_len_k_end.size(0) == seq_len and cu_seq_len_k_end.is_contiguous() and cu_seq_len_k_end.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(block_table.dim() == 2 and block_table.stride(1) == 1 and block_table.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(seq_indices.size(0) == seq_len and seq_indices.is_contiguous() and seq_indices.scalar_type() == torch::kInt);
+    int block_table_stride = block_table.stride(0);
+
+    // Allocate output
+    constexpr int split_kv = 256;
+    const int block_q = 128 / num_heads;
+    const int total_kv_tokens = num_kv_blocks * block_kv;
+    const int stride_logits_alignment = 1024 / static_cast<int>(c10::elementSize(logits_dtype));
+    int aligned_seq_len = align(seq_len, block_q), stride_logits;
+    torch::Tensor logits;
+    if (max_seqlen_k == 0) {
+        stride_logits = align(total_kv_tokens + split_kv, stride_logits_alignment);
+        logits = torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(logits_dtype));
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, total_kv_tokens)});
+    } else {
+        stride_logits = align(align(max_seqlen_k, split_kv), stride_logits_alignment);
+        logits = torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(logits_dtype));
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, max_seqlen_k)});
+    }
+
+    // Dispatch: separated_storage=true, force_contiguous=false
+    sm100_prefill_paged_mqa_logits(false, q, std::nullopt, kv_data, kv_sf, weights,
+                                   cu_seq_len_k_start, cu_seq_len_k_end, logits,
+                                   block_table, seq_indices, logits_dtype,
+                                   seq_len, num_kv_blocks, num_heads, head_dim,
+                                   block_kv, max_seqlen_k, stride_logits, block_table_stride,
+                                   block_q, split_kv, false, true);
+    return logits;
+}
+
+
 // Legacy API wrappers
 static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                                     const std::tuple<torch::Tensor, torch::Tensor>& kv,
@@ -453,6 +671,22 @@ static void register_apis(pybind11::module_& m) {
           py::arg("clean_logits") = false,
           py::arg("logits_dtype") = torch::kFloat32,
           py::arg("indices") = std::nullopt);
+    m.def("fp8_fp4_prefill_paged_mqa_logits", &fp8_fp4_prefill_paged_mqa_logits,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("block_table"), py::arg("seq_indices"),
+          py::arg("clean_logits") = false,
+          py::arg("max_seqlen_k") = 0,
+          py::arg("logits_dtype") = torch::kFloat32,
+          py::arg("force_contiguous") = false,
+          py::arg("separated_storage") = false);
+    m.def("fp8_prefill_paged_mqa_logits_separated", &fp8_prefill_paged_mqa_logits_separated,
+          py::arg("q"), py::arg("kv_data"), py::arg("kv_sf"),
+          py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("block_table"), py::arg("seq_indices"),
+          py::arg("max_seqlen_k") = 0,
+          py::arg("logits_dtype") = torch::kFloat32);
     // Legacy API
     m.def("fp8_mqa_logits", &fp8_mqa_logits,
           py::arg("q"), py::arg("kv"), py::arg("weights"),

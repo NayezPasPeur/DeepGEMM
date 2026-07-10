@@ -514,4 +514,259 @@ static void sm100_paged_mqa_logits(const bool& is_fp4,
     SM100PagedMQALogitsRuntime::launch(runtime, args);
 }
 
+// Prefill paged variant: round-robin Q-block scheduler + 3D TMA paged KV
+// No metadata kernel needed; per-token cu_seq_len_k masking like contiguous
+
+class SM100PrefillPagedMQALogitsRuntime final: public LaunchRuntime<SM100PrefillPagedMQALogitsRuntime> {
+public:
+    struct Args {
+        bool is_fp4;
+        int num_q_tokens;
+        int num_kv_pages;
+        int stride_logits;
+        int num_heads, head_dim;
+        int page_kv;
+        bool is_compressed_logits;
+        int block_table_stride;
+        bool force_contiguous;
+        bool separated_storage;
+
+        int num_q_stages;
+        int num_kv_stages;
+        int block_q;
+        int split_kv;
+
+        int* cu_seq_len_k_start;
+        int* cu_seq_len_k_end;
+        int* block_table;
+        int* seq_indices;
+        void* logits;
+
+        CUtensorMap tensor_map_q;
+        CUtensorMap tensor_map_sf_q;
+        CUtensorMap tensor_map_kv;
+        CUtensorMap tensor_map_sf_kv;
+        CUtensorMap tensor_map_weights;
+        at::ScalarType logits_dtype;
+        at::ScalarType weights_dtype;
+
+        int num_specialized_threads;
+        int num_math_threads;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_prefill_paged_mqa_logits<
+        {},
+        {}, {},
+        {},
+        {}, {}, {},
+        {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}
+    >);
+}};
+)", args.is_fp4 ? "true" : "false",
+    args.num_heads, args.head_dim,
+    args.is_compressed_logits ? "true" : "false",
+    args.block_q, args.split_kv, args.page_kv,
+    args.num_q_stages, args.num_kv_stages,
+    args.launch_args.grid_dim.first,
+    args.num_specialized_threads, args.num_math_threads,
+    to_string(args.logits_dtype),
+    args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float",
+    args.force_contiguous ? "true" : "false",
+    args.separated_storage ? "true" : "false");
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.num_q_tokens, args.num_kv_pages,
+            args.stride_logits, args.block_table_stride,
+            args.cu_seq_len_k_start, args.cu_seq_len_k_end,
+            args.block_table, args.seq_indices, args.logits,
+            args.tensor_map_q, args.tensor_map_sf_q,
+            args.tensor_map_kv, args.tensor_map_sf_kv,
+            args.tensor_map_weights
+        ));
+    }
+};
+
+static void sm100_prefill_paged_mqa_logits(const bool& is_fp4,
+                                           const torch::Tensor& q,
+                                           const std::optional<torch::Tensor>& sf_q,
+                                           const torch::Tensor& kv_cache,
+                                           const torch::Tensor& kv_cache_sf,
+                                           const torch::Tensor& weights,
+                                           const torch::Tensor& cu_seq_len_k_start,
+                                           const torch::Tensor& cu_seq_len_k_end,
+                                           const torch::Tensor& logits,
+                                           const torch::Tensor& block_table,
+                                           const torch::Tensor& seq_indices,
+                                           const at::ScalarType& logits_dtype,
+                                           const int& num_q_tokens,
+                                           const int& num_kv_blocks,
+                                           const int& num_heads,
+                                           const int& head_dim,
+                                           const int& page_kv,
+                                           const int& max_seqlen_k,
+                                           const int& stride_logits,
+                                           const int& block_table_stride,
+                                           const int& block_q,
+                                           const int& split_kv,
+                                           const bool& force_contiguous = false,
+                                           const bool& separated_storage = false) {
+    const int num_specialized_threads = 128;
+    const int num_math_threads = 2 * 128;
+    const int num_q_stages = 3;
+    const int num_kv_stages = is_fp4 ? 10 : 5;
+    const int num_sms = device_runtime->get_num_sms();
+
+    const bool is_compressed_logits = (max_seqlen_k > 0);
+    const int num_kv_pages = num_kv_blocks;
+
+    // TMA descriptors: Q and weights use 2D (like contiguous)
+    // KV uses: 3D (paged interleaved), or 2D-pool (force_contiguous or separated_storage)
+    CUtensorMap tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv;
+    const int num_kv_tokens = num_kv_blocks * page_kv;
+    const bool use_2d_kv_desc = force_contiguous or separated_storage;
+    if (is_fp4) {
+        DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
+        tensor_map_q = make_tma_2d_desc(q, head_dim, num_q_tokens * num_heads,
+                                        head_dim, block_q * num_heads,
+                                        static_cast<int>(q.stride(1)),
+                                        head_dim / 2, 0, false, false);
+        tensor_map_sf_q = make_tma_2d_desc(sf_q.value(), num_heads, num_q_tokens,
+                                           num_heads, block_q,
+                                           static_cast<int>(sf_q.value().stride(0)), 0);
+        if (use_2d_kv_desc) {
+            tensor_map_kv = make_tma_2d_desc(kv_cache, head_dim, num_kv_tokens,
+                                             head_dim, separated_storage ? page_kv : split_kv,
+                                             static_cast<int>(kv_cache.stride(1)),
+                                             head_dim / 2, 0, false, false);
+            tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf,
+                                                get_tma_aligned_size(num_kv_tokens, static_cast<int>(kv_cache_sf.element_size())), 1,
+                                                separated_storage ? page_kv : split_kv, 1, 0, 0);
+        } else {
+            tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
+                                             head_dim, page_kv, 1,
+                                             static_cast<int>(kv_cache.stride(1)),
+                                             static_cast<int>(kv_cache.stride(0)),
+                                             head_dim / 2, 0, false, false);
+            tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
+                                                page_kv, 1,
+                                                static_cast<int>(kv_cache_sf.stride(0)), 0);
+        }
+    } else {
+        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+        tensor_map_q = make_tma_2d_desc(q, head_dim, num_q_tokens * num_heads,
+                                        head_dim, block_q * num_heads,
+                                        static_cast<int>(q.stride(1)),
+                                        head_dim);
+        if (use_2d_kv_desc) {
+            tensor_map_kv = make_tma_2d_desc(kv_cache, head_dim, num_kv_tokens,
+                                             head_dim, separated_storage ? page_kv : split_kv,
+                                             static_cast<int>(kv_cache.stride(1)),
+                                             head_dim);
+            tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf,
+                                                get_tma_aligned_size(num_kv_tokens, static_cast<int>(kv_cache_sf.element_size())), 1,
+                                                separated_storage ? page_kv : split_kv, 1, 0, 0);
+        } else {
+            tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
+                                             head_dim, page_kv, 1,
+                                             static_cast<int>(kv_cache.stride(1)),
+                                             static_cast<int>(kv_cache.stride(0)),
+                                             head_dim);
+            tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
+                                                page_kv, 1,
+                                                static_cast<int>(kv_cache_sf.stride(0)), 0);
+        }
+        tensor_map_sf_q = tensor_map_sf_kv;  // unused by FP8
+    }
+    const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, num_q_tokens,
+                                                     num_heads, block_q,
+                                                     static_cast<int>(weights.stride(0)), 0);
+
+    // Compute shared memory size
+    const auto dispatch_heads = [&](auto&& fn) {
+        switch (num_heads) {
+            case 8:  return fn(cute::C<8>{});
+            case 16: return fn(cute::C<16>{});
+            case 32: return fn(cute::C<32>{});
+            case 64: return fn(cute::C<64>{});
+            default: DG_HOST_UNREACHABLE("Unsupported num_heads for prefill paged MQA logits");
+        }
+    };
+
+    int smem_size;
+    if (is_fp4) {
+        smem_size = dispatch_heads([&](auto h) {
+            constexpr int H = decltype(h)::value;
+            const auto get_smem = [&](auto d) {
+                constexpr int D = decltype(d)::value;
+                return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<true, H, D, 128 / H, 256, 3, 10, 3>));
+            };
+            return head_dim == 64 ? get_smem(cute::C<64>{}) : get_smem(cute::C<128>{});
+        });
+    } else {
+        smem_size = dispatch_heads([&](auto h) {
+            constexpr int H = decltype(h)::value;
+            switch (head_dim) {
+                case 32:  return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, 32, 128 / H, 256, 3, 5, 3>));
+                case 64:  return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, 64, 128 / H, 256, 3, 5, 3>));
+                case 128: return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<false, H, 128, 128 / H, 256, 3, 5, 3>));
+                default:  DG_HOST_UNREACHABLE("Unsupported head_dim for prefill paged MQA logits");
+            }
+        });
+    }
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+
+    const SM100PrefillPagedMQALogitsRuntime::Args args = {
+        .is_fp4 = is_fp4,
+        .num_q_tokens = num_q_tokens,
+        .num_kv_pages = num_kv_pages,
+        .stride_logits = stride_logits,
+        .num_heads = num_heads, .head_dim = head_dim,
+        .page_kv = page_kv,
+        .is_compressed_logits = is_compressed_logits,
+        .block_table_stride = block_table_stride,
+        .force_contiguous = force_contiguous,
+        .separated_storage = separated_storage,
+        .num_q_stages = num_q_stages,
+        .num_kv_stages = num_kv_stages,
+        .block_q = block_q,
+        .split_kv = split_kv,
+        .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
+        .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
+        .block_table = block_table.data_ptr<int>(),
+        .seq_indices = seq_indices.data_ptr<int>(),
+        .logits = logits.data_ptr(),
+        .tensor_map_q = tensor_map_q,
+        .tensor_map_sf_q = tensor_map_sf_q,
+        .tensor_map_kv = tensor_map_kv,
+        .tensor_map_sf_kv = tensor_map_sf_kv,
+        .tensor_map_weights = tensor_map_weights,
+        .logits_dtype = logits_dtype,
+        .weights_dtype = weights.scalar_type(),
+        .num_specialized_threads = num_specialized_threads,
+        .num_math_threads = num_math_threads,
+        .launch_args = LaunchArgs(num_sms,
+                                  num_specialized_threads + num_math_threads,
+                                  smem_size)
+    };
+    const auto code = SM100PrefillPagedMQALogitsRuntime::generate(args);
+    const auto runtime = compiler->build("sm100_prefill_paged_mqa_logits", code);
+    SM100PrefillPagedMQALogitsRuntime::launch(runtime, args);
+}
+
 } // namespace deep_gemm
