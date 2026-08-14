@@ -15,7 +15,6 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/scheduler/sm100_mqa_logits.cuh>
 #include <deep_gemm/scheduler/sm100_paged_mqa_logits.cuh>
-#include <deep_gemm/scheduler/sm100_prefill_paged_mqa_logits.cuh>
 
 // Shared SM100 MQA logits core plus contiguous-KV and paged entries
 // Both entries use the same q / sf_q / kv / sf_kv / weights TMA signature
@@ -204,26 +203,13 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     if (cute::elect_one_sync()) {
                         #pragma unroll
                         for (uint32_t page_idx = 0; page_idx < kNumPagesPerSplit; ++ page_idx) {
-                            if constexpr (decltype(scheduler)::kUse2DPagedTMA) {
-                                // Separated storage: 2D TMA with page_coord * kPageKV as row offset
-                                const uint32_t kv_row = page_coords[page_idx] * kPageKV;
-                                tma::copy<kNumQKBytesPerToken, kPageKV, 0>(
-                                    &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
-                                    smem.smem_kv[kv_stage_idx] + page_idx * kPageKV * kNumQKBytesPerToken,
-                                    0, kv_row);
-                                tma::copy<kPageKV, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
-                                                         smem.smem_sf_kv[kv_stage_idx] + page_idx * kPageKV,
-                                                         kv_row, 0);
-                            } else {
-                                // Interleaved storage: 3D TMA with page_coord as batch index
-                                tma::copy<kNumQKBytesPerToken, kPageKV, 0, typename SharedStorage::qk_dtype_t, true>(
-                                    &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
-                                    smem.smem_kv[kv_stage_idx] + page_idx * kPageKV * kNumQKBytesPerToken,
-                                    0, 0, 1, page_coords[page_idx]);
-                                tma::copy<kPageKV, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
-                                                         smem.smem_sf_kv[kv_stage_idx] + page_idx * kPageKV,
-                                                         0, page_coords[page_idx]);
-                            }
+                            tma::copy<kNumQKBytesPerToken, kPageKV, 0, typename SharedStorage::qk_dtype_t, true>(
+                                &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
+                                smem.smem_kv[kv_stage_idx] + page_idx * kPageKV * kNumQKBytesPerToken,
+                                0, 0, 1, page_coords[page_idx]);
+                            tma::copy<kPageKV, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
+                                                     smem.smem_sf_kv[kv_stage_idx] + page_idx * kPageKV,
+                                                     0, page_coords[page_idx]);
                         }
                         smem.full_kv_barriers[kv_stage_idx].arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
                     }
@@ -597,55 +583,6 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     // Paged uses `kNumSMs = 0`; schedule meta drives the grid stride
     sm100_mqa_logits_core_impl<kIsFP4, kNumHeads, kHeadDim, false, BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, 0,
-                               kNumSpecializedThreads, kNumMathThreads, logits_dtype_t,
-                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
-        logits_stride, logits,
-        tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
-        make_scheduler);
-}
-
-// Prefill paged entry: round-robin Q-block scheduler + 3D TMA paged KV loading
-// No metadata kernel needed; uses cu_seq_len_k_start/end per token like contiguous
-// Supports multi-sequence batched prefill via seq_indices mapping
-// kForceContiguous=true: use 2D TMA contiguous path (single copy per split)
-// kSeparatedStorage=true: KV data/scales stored separately; use 2D TMA per-page with row offset
-template <bool kIsFP4, uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsCompressedLogits,
-          uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV,
-          uint32_t kNumQStages, uint32_t kNumKVStages,
-          uint32_t kNumSMs,
-          uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
-          typename logits_dtype_t, typename reduce_dtype_t = float,
-          bool kForceContiguous = false,
-          bool kSeparatedStorage = false,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
-CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
-void sm100_prefill_paged_mqa_logits(const uint32_t num_q_tokens,
-                                    const uint32_t num_kv_pages,
-                                    const uint32_t logits_stride,
-                                    const uint32_t block_table_stride,
-                                    const uint32_t* cu_seq_len_k_start,
-                                    const uint32_t* cu_seq_len_k_end,
-                                    const uint32_t* block_table,
-                                    const uint32_t* seq_indices,
-                                    logits_dtype_t* logits,
-                                    const __grid_constant__ cute::TmaDescriptor tensor_map_q,
-                                    const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
-                                    const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
-                                    const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
-                                    const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
-    static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
-    DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit, "Invalid split/page size");
-
-    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* seq_k_start, uint32_t* seq_k_end) {
-        return sched::SM100PrefillPagedMQALogitsScheduler<BLOCK_Q, SPLIT_KV, PAGE_KV, kNumSMs, kForceContiguous, kSeparatedStorage>(
-            sm_idx, num_q_tokens, cu_seq_len_k_start, cu_seq_len_k_end,
-            seq_k_start, seq_k_end,
-            block_table, block_table_stride, seq_indices, num_kv_pages);
-    };
-
-    sm100_mqa_logits_core_impl<kIsFP4, kNumHeads, kHeadDim, kIsCompressedLogits, BLOCK_Q, SPLIT_KV,
-                               kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
